@@ -3,7 +3,10 @@ package com.github.brokenithm.activity
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
-import android.graphics.*
+import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.Paint
+import android.graphics.Rect
 import android.graphics.drawable.BitmapDrawable
 import android.hardware.Sensor
 import android.hardware.SensorEvent
@@ -13,10 +16,20 @@ import android.nfc.NfcAdapter
 import android.nfc.NfcManager
 import android.nfc.Tag
 import android.nfc.tech.MifareClassic
-import android.os.*
+import android.os.Build
+import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.os.SystemClock
+import android.os.VibrationEffect
+import android.os.Vibrator
 import android.util.Log
 import android.view.*
-import android.widget.*
+import android.widget.Button
+import android.widget.CheckBox
+import android.widget.EditText
+import android.widget.TextView
+import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.lifecycle.lifecycleScope
 import com.github.brokenithm.BrokenithmApplication
@@ -24,9 +37,19 @@ import com.github.brokenithm.R
 import com.github.brokenithm.util.AsyncTaskUtil
 import com.github.brokenithm.util.FeliCa
 import net.cachapa.expandablelayout.ExpandableLayout
-import java.net.*
+import java.net.BindException
+import java.net.DatagramPacket
+import java.net.DatagramSocket
+import java.net.Inet4Address
+import java.net.Inet6Address
+import java.net.InetAddress
+import java.net.InetSocketAddress
+import java.net.NetworkInterface
+import java.net.Socket
+import java.net.SocketTimeoutException
 import java.nio.ByteBuffer
-import java.util.*
+import java.util.ArrayDeque
+import java.util.Collections
 import kotlin.concurrent.thread
 import kotlin.math.abs
 
@@ -175,49 +198,83 @@ class MainActivity : AppCompatActivity() {
     private val cardId = ByteArray(10)
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
+
         val tag: Tag = intent.getParcelableExtra(NfcAdapter.EXTRA_TAG) ?: return
         val felica = FeliCa.get(tag)
+
         if (felica != null) {
             thread {
-                try {
+                runCatching {
                     felica.connect()
                     felica.poll()
-                    felica.IDm?.copyInto(cardId) ?: throw IllegalStateException("Failed to fetch IDm from FeliCa")
+
+                    felica.IDm?.copyInto(cardId)
+                        ?: throw IllegalStateException("Failed to fetch IDm from FeliCa")
                     cardId[8] = 0
                     cardId[9] = 0
                     cardType = CardType.CARD_FELICA
                     hasCard = true
+
                     Log.d(TAG, "Found FeliCa card: ${cardId.toHexString().removeRange(16..19)}")
-                    while (felica.isConnected) Thread.sleep(50)
-                    hasCard = false
-                    felica.close()
-                } catch (e: Exception) {
-                    e.printStackTrace()
-                }
+
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                        adapter?.ignore(
+                            tag,
+                            200,
+                            {
+                                hasCard = false
+                                runCatching { felica.close() }
+                            },
+                            Handler(Looper.getMainLooper())
+                        )
+                    } else {
+                        while (felica.isConnected) {
+                            Thread.sleep(200)
+                        }
+                        hasCard = false
+                        felica.close()
+                    }
+                }.onFailure { e -> e.printStackTrace() }
             }
+
             return
         }
+
         val mifare = MifareClassic.get(tag) ?: return
         thread {
-            try {
+            runCatching {
                 mifare.connect()
-                if (mifare.authenticateBlock(2, keyA = mAimeKey, keyB = mAimeKey) ||
-                    mifare.authenticateBlock(2, keyA = mBanaKey, keyB = mAimeKey)) {
-                    Thread.sleep(100)
-                    val block = mifare.readBlock(2)
-                    block.copyInto(cardId, 0, 6, 16)
-                    cardType = CardType.CARD_AIME
-                    hasCard = true
-                    Log.d(TAG, "Found Aime card: ${cardId.toHexString()}")
-                    while (mifare.isConnected) Thread.sleep(50)
-                    hasCard = false
-                } else {
-                    Log.d(TAG, "NFC auth failed")
+                if (!mifare.authenticateBlock(2, keyA = mAimeKey, keyB = mAimeKey) &&
+                    !mifare.authenticateBlock(2, keyA = mBanaKey, keyB = mAimeKey)) {
+                    Log.d(TAG, "NFC authentication failed")
                 }
-                mifare.close()
-            } catch (e: Exception) {
-                e.printStackTrace()
-            }
+
+                mifare
+                    .readBlock(2)
+                    .copyInto(cardId, 0, 6, 16)
+                cardType = CardType.CARD_AIME
+                hasCard = true
+
+                Log.d(TAG, "Found Aime card: ${cardId.toHexString()}")
+
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                    adapter?.ignore(
+                        tag,
+                        200,
+                        {
+                            hasCard = false
+                            runCatching { mifare.close() }
+                        },
+                        Handler(Looper.getMainLooper())
+                    )
+                } else {
+                    while (mifare.isConnected) {
+                        Thread.sleep(200)
+                    }
+                    hasCard = false
+                    mifare.close()
+                }
+            }.onFailure { e -> e.printStackTrace() }
         }
     }
 
@@ -473,6 +530,7 @@ class MainActivity : AppCompatActivity() {
             }
             val currentAirAreaHeight = if (mAirSource != 3) 0f else airAreaHeight
             val currentButtonAreaHeight = if (mAirSource != 3) 0f else buttonAreaHeight
+            val halfOfButtonArea = (windowHeight - currentButtonAreaHeight) / 2
             val totalTouches = event.pointerCount
             val touchedButtons = HashSet<Int>()
             var thisAirHeight = 6
@@ -486,7 +544,7 @@ class MainActivity : AppCompatActivity() {
                         continue
                     val x = event.getX(i) + mTouchAreaRect!!.left - windowLeft
                     val y = event.getY(i) + mTouchAreaRect!!.top - windowTop
-                    when(y) {
+                    when (y) {
                         in 0f..currentAirAreaHeight -> {
                             thisAirHeight = 0
                         }
@@ -496,26 +554,26 @@ class MainActivity : AppCompatActivity() {
                         }
                         in currentButtonAreaHeight..windowHeight -> {
                             val pointPos = x / buttonBlockWidth
-                            var index = pointPos.toInt()
-                            if (index > numOfButtons) index = numOfButtons
+                            var colIndex = pointPos.toInt()
+                            if (colIndex > numOfButtons) colIndex = numOfButtons
 
                             if (mEnableTouchSize) {
-                                var centerButton = index * 2
+                                var centerButton = colIndex * 2
                                 if (touchedButtons.contains(centerButton)) centerButton++
-                                var leftButton = ((index - 1) * 2).coerceAtLeast(0)
+                                var leftButton = ((colIndex - 1) * 2).coerceAtLeast(0)
                                 if (touchedButtons.contains(leftButton)) leftButton++
-                                var rightButton = ((index + 1) * 2).coerceAtMost(numOfButtons * 2)
+                                var rightButton = ((colIndex + 1) * 2).coerceAtMost(numOfButtons * 2)
                                 if (touchedButtons.contains(rightButton)) rightButton++
-                                var left2Button = ((index - 2) * 2).coerceAtLeast(0)
+                                var left2Button = ((colIndex - 2) * 2).coerceAtLeast(0)
                                 if (touchedButtons.contains(left2Button)) left2Button++
-                                var right2Button = ((index + 2) * 2).coerceAtMost(numOfButtons * 2)
+                                var right2Button = ((colIndex + 2) * 2).coerceAtMost(numOfButtons * 2)
                                 if (touchedButtons.contains(right2Button)) right2Button++
 
                                 val currentSize = event.getSize(i)
                                 maxTouchedSize = maxTouchedSize.coerceAtLeast(currentSize)
 
                                 touchedButtons.add(centerButton)
-                                when ((pointPos - index) * 4) {
+                                when ((pointPos - colIndex) * 4) {
                                     in 0f..1f -> {
                                         touchedButtons.add(leftButton)
                                         if (currentSize >= mExtraFatTouchSizeThreshold) {
@@ -542,22 +600,29 @@ class MainActivity : AppCompatActivity() {
                                     }
                                 }
                             } else {
-                                if (index > 15) index = 15
-                                var targetIndex = index * 2
-                                if (touchedButtons.contains(targetIndex)) targetIndex++
+                                colIndex = colIndex.coerceAtMost(15)
+
+                                val isOnSecondRow = (y - currentButtonAreaHeight) >= halfOfButtonArea
+                                var targetIndex = colIndex * 2 + if (isOnSecondRow) 0 else 1
+
+                                if (touchedButtons.contains(targetIndex)) {
+                                    targetIndex++
+                                }
+
                                 touchedButtons.add(targetIndex)
-                                if (index > 0) {
-                                    if ((pointPos - index) * 4 < 1) {
-                                        targetIndex = (index - 1) * 2
-                                        if (touchedButtons.contains(targetIndex)) targetIndex++
-                                        touchedButtons.add(targetIndex)
+
+                                if (colIndex > 0 && (pointPos - colIndex) * 4 < 1) {
+                                    targetIndex = (colIndex - 1) * 2 + if (isOnSecondRow) 0 else 1
+                                    if (touchedButtons.contains(targetIndex)) {
+                                        targetIndex++
                                     }
-                                } else if (index < 31) {
-                                    if ((pointPos - index) * 4 > 3) {
-                                        targetIndex = (index + 1) * 2
-                                        if (touchedButtons.contains(targetIndex)) targetIndex++
-                                        touchedButtons.add(targetIndex)
+                                    touchedButtons.add(targetIndex)
+                                } else if (colIndex < 31 && (pointPos - colIndex) * 4 > 3) {
+                                    targetIndex = (colIndex + 1) * 2 + if (isOnSecondRow) 0 else 1
+                                    if (touchedButtons.contains(targetIndex)) {
+                                        targetIndex++
                                     }
+                                    touchedButtons.add(targetIndex)
                                 }
                             }
                         }
